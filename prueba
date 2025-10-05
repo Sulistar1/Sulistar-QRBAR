@@ -1,0 +1,299 @@
+<!doctype html>
+<html lang="es">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>HIBC UDI — Lector y Generador (DataMatrix)</title>
+<style>
+  :root { --pad: 16px; }
+  body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; margin:0; padding: var(--pad); background:#fafafa; color:#222; }
+  h1,h2,h3 { margin: 0 0 8px; }
+  .card { background:#fff; border:1px solid #e5e7eb; border-radius:14px; padding:var(--pad); box-shadow:0 1px 2px rgba(0,0,0,.04); margin-bottom:16px; }
+  .grid { display:grid; grid-template-columns: repeat(auto-fit,minmax(220px,1fr)); gap:12px; }
+  .field { display:flex; flex-direction:column; gap:6px; }
+  .field label { font-size:13px; color:#555; }
+  .field input, .field textarea { border:1px solid #d1d5db; border-radius:10px; padding:10px 12px; font-size:14px; background:#fff; outline:none; }
+  .field input:focus, .field textarea:focus { border-color:#6366f1; box-shadow:0 0 0 3px rgba(99,102,241,.18); }
+  .row { display:flex; gap:8px; flex-wrap:wrap; }
+  button { appearance:none; border:none; background:#111827; color:#fff; padding:10px 14px; border-radius:10px; font-weight:600; cursor:pointer; }
+  button.secondary { background:#4b5563; }
+  button:disabled { opacity:.6; cursor:not-allowed; }
+  canvas { border:1px dashed #d1d5db; background:#fff; border-radius:10px; display:block; max-width:100%; }
+  #log { white-space:pre-wrap; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace; background:#0b1221; color:#d1e7ff; border-radius:10px; padding:12px; min-height:84px; }
+  small.muted { color:#6b7280; }
+</style>
+</head>
+<body>
+  <h2>Escáner HIBC UDI — leer y generar DataMatrix</h2>
+  <p class="card" style="line-height:1.5">
+    Conecta tu <b>pistola 2D</b> en modo <i>keyboard-wedge</i> (simula teclado). Este visor:
+    <ul>
+      <li>Lee el contenido decodificado del DataMatrix HIBC.</li>
+      <li>Extrae <b>REF</b>, <b>LOTE</b> y <b>Caducidad</b> (si viene).</li>
+      <li>Permite <b>generar un nuevo DataMatrix</b> HIBC con esos datos.</li>
+    </ul>
+    <small class="muted">Si tu lector trabaja por puerto serie (COM/USB CDC), esto no capturará nada: en ese caso necesitarás una app de escritorio (Node/Python). Para teclado, funciona directo en el navegador.</small>
+  </p>
+
+  <!-- Tarjeta: Entrada / Escaneo -->
+  <div class="card">
+    <h3>1) Escanear o pegar texto HIBC</h3>
+    <div class="grid">
+      <div class="field" style="grid-column:1/-1">
+        <label>Texto escaneado / RAW (pega aquí o escanea y pulsa Enter)</label>
+        <input id="raw" placeholder="+J0228706371/ $$3270531 1705311   (ejemplo similar a tu etiqueta)"/>
+        <small class="muted">Acepta variantes con <code>+</code> para Primary y <code>$</code> / <code>$$</code> para Secondary. Se ignoran espacios extra.</small>
+      </div>
+    </div>
+    <div class="row" style="margin-top:8px">
+      <button id="parseBtn">Parsear HIBC</button>
+      <button id="clearBtn" class="secondary">Limpiar</button>
+    </div>
+  </div>
+
+  <!-- Tarjeta: Campos -->
+  <div class="card">
+    <h3>2) Campos detectados / editables</h3>
+    <div class="grid">
+      <div class="field">
+        <label>REF (Primary)</label>
+        <input id="ref" placeholder="Ej: J0228706371" />
+      </div>
+      <div class="field">
+        <label>Primary extra (tras la barra “/” si existiera)</label>
+        <input id="primaryExtra" placeholder="Opcional" />
+      </div>
+      <div class="field">
+        <label>Secondary (RAW)</label>
+        <input id="secondary" placeholder="Si ya viene de la etiqueta (empieza por $ o $$) se respeta" />
+      </div>
+      <div class="field">
+        <label>LOTE</label>
+        <input id="lot" placeholder="Ej: 1705311" />
+      </div>
+      <div class="field">
+        <label>Caducidad (YYYY-MM-DD)</label>
+        <input id="expiry" placeholder="Ej: 2027-05-31" />
+      </div>
+    </div>
+  </div>
+
+  <!-- Tarjeta: Generación -->
+  <div class="card">
+    <h3>3) Generar DataMatrix HIBC</h3>
+    <div class="row" style="margin-bottom:8px">
+      <button id="generateBtn">Generar código (canvas)</button>
+      <button id="downloadBtn" class="secondary" disabled>Descargar PNG</button>
+    </div>
+    <canvas id="dmCanvas" width="360" height="360" aria-label="DataMatrix generado"></canvas>
+    <small class="muted">Se genera con <b>DataMatrix ECC200</b> mediante <code>bwip-js</code>. El payload es la cadena HIBC que se muestra en el registro.</small>
+  </div>
+
+  <!-- Tarjeta: Registro -->
+  <div class="card">
+    <h3>Registro / depuración</h3>
+    <div id="log"></div>
+  </div>
+
+  <!-- Input oculto para forzar foco y recibir el escaneo si el lector usa Enter -->
+  <input id="scanInput" style="position:absolute; left:-9999px; opacity:0" aria-hidden="true" />
+
+  <!-- Librería de códigos de barras -->
+  <script src="https://unpkg.com/bwip-js@2.0.10/dist/bwip-js-min.js"></script>
+
+<script>
+/* ---------- Utilidades UI ---------- */
+const $ = (id) => document.getElementById(id);
+function log(msg) { $('log').textContent += msg + "\\n"; }
+function clearLog(){ $('log').textContent=''; }
+
+/* ---------- Parser HIBC (robusto para casos comunes) ----------
+   Admite: "+PRIMARY[/EXTRA] $$SECONDARY" con espacios opcionales.
+   Extrae REF, posible EXTRA, LOTE y CADUCIDAD (YYYY-MM-DD si está).
+*/
+function parseHIBC(text) {
+  const out = { raw: text, primary: null, secondary: null, ref: null, primaryExtra: '', lot: null, expiry: null };
+
+  let s = (text || '').trim();
+  if (!s) return out;
+
+  // Capturar Secondary si aparece con $ / $$
+  let primary = s, secondary = null;
+  const secMatch = s.match(/(\$\$?.*)$/); // última ocurrencia de $.. al final
+  if (secMatch) {
+    const idx = secMatch.index;
+    if (idx !== null && idx !== undefined) {
+      primary = s.slice(0, idx).trim();
+      secondary = s.slice(idx).trim();
+    }
+  } else {
+    // Alternativa: algunos separan con espacios
+    const parts = s.split(/\s{2,}|\t/);
+    if (parts.length > 1) {
+      primary = parts[0].trim();
+      secondary = parts.slice(1).join(' ').trim();
+    }
+  }
+
+  out.primary = primary || null;
+  out.secondary = secondary || null;
+
+  // Primary: +REF[/EXTRA]
+  if (primary) {
+    const m = primary.match(/^\+([A-Z0-9]+)(?:\/([A-Z0-9]+))?$/i);
+    if (m) {
+      out.ref = m[1];
+      out.primaryExtra = m[2] || '';
+    } else {
+      // Fallback: quitar '+' y posibles espacios/barras sueltas
+      out.ref = primary.replace(/^\+/, '').replace(/\/+$/, '').trim();
+    }
+  }
+
+  // Secondary: limpiar prefijos $ y dividir en tokens para heurística de LOTE/FECHA
+  if (secondary) {
+    const secClean = secondary.replace(/^\$+/, '').trim();
+    out.secondaryRaw = secondary; // conservar tal cual, por si prefieres reimprimir exactamente igual
+
+    // Tokens separando por espacio, slash o guiones
+    const tokens = secClean.split(/[\\s\\/\\-]+/).filter(Boolean);
+
+    // Buscar fecha ISO primero
+    for (const t of tokens) {
+      if (/^\\d{4}-\\d{2}-\\d{2}$/.test(t)) { out.expiry = t; break; }
+    }
+    // Buscar un token para LOTE (alfanumérico 5+ es buena señal)
+    if (!out.lot) {
+      const cand = tokens.find(t => /[A-Z0-9]{5,}/i.test(t));
+      if (cand) out.lot = cand;
+    }
+    // Si aún no hay lote y hay un único token, usarlo
+    if (!out.lot && tokens.length === 1) out.lot = tokens[0];
+  }
+
+  return out;
+}
+
+/* ---------- Constructor de cadena HIBC ----------
+   Si suministras 'secondaryRaw' (por ejemplo lo leído original), lo respeta.
+   Si no, compone a partir de lote/fecha como "$$<lot> <expiry>".
+*/
+function buildHIBCString({ ref, primaryExtra, lot, expiry, secondaryRaw }) {
+  if (!ref) ref = '';
+  let primary = '+' + ref.replace(/^\\+/, '');
+  if (primaryExtra) primary += '/' + primaryExtra;
+
+  let secondary = '';
+  if (secondaryRaw && secondaryRaw.trim()) {
+    secondary = secondaryRaw.startsWith('$') ? secondaryRaw.trim() : '$$' + secondaryRaw.trim();
+  } else if (lot || expiry) {
+    secondary = '$$' + (lot || '');
+    if (expiry) secondary += ' ' + expiry;
+  }
+
+  return (primary + (secondary ? ' ' + secondary : '')).trim();
+}
+
+/* ---------- Generador DataMatrix (bwip-js) ---------- */
+function renderDataMatrix(payload) {
+  const canvas = $('dmCanvas');
+  const ctx = canvas.getContext('2d');
+  ctx.clearRect(0,0,canvas.width,canvas.height);
+  if (!payload) { $('downloadBtn').disabled = true; return; }
+
+  try {
+    bwipjs.toCanvas(canvas, {
+      bcid: 'datamatrix',
+      text: payload,
+      scale: 5,
+      padding: 12,
+      includetext: false
+    });
+    $('downloadBtn').disabled = false;
+    log('✔ DataMatrix generado para: ' + payload);
+    window.__lastPayload = payload;
+  } catch (e) {
+    $('downloadBtn').disabled = true;
+    log('✖ Error generando DataMatrix: ' + e);
+  }
+}
+
+/* ---------- Wiring UI ---------- */
+$('parseBtn').addEventListener('click', () => {
+  clearLog();
+  const raw = $('raw').value.trim();
+  if (!raw) { log('Introduce o escanea una cadena HIBC.'); return; }
+  const p = parseHIBC(raw);
+
+  $('ref').value          = p.ref || '';
+  $('primaryExtra').value = p.primaryExtra || '';
+  $('secondary').value    = p.secondaryRaw || p.secondary || '';
+  $('lot').value          = p.lot || '';
+  $('expiry').value       = p.expiry || '';
+
+  log('RAW: ' + raw);
+  log('Parsed: ' + JSON.stringify(p, null, 2));
+});
+
+$('clearBtn').addEventListener('click', () => {
+  $('raw').value = '';
+  $('ref').value = '';
+  $('primaryExtra').value = '';
+  $('secondary').value = '';
+  $('lot').value = '';
+  $('expiry').value = '';
+  $('downloadBtn').disabled = true;
+  const ctx = $('dmCanvas').getContext('2d');
+  ctx.clearRect(0,0,$('dmCanvas').width,$('dmCanvas').height);
+  clearLog();
+});
+
+$('generateBtn').addEventListener('click', () => {
+  clearLog();
+  const payload = buildHIBCString({
+    ref: $('ref').value.trim(),
+    primaryExtra: $('primaryExtra').value.trim(),
+    lot: $('lot').value.trim(),
+    expiry: $('expiry').value.trim(),
+    secondaryRaw: $('secondary').value.trim()
+  });
+  log('Payload HIBC a codificar: ' + payload);
+  renderDataMatrix(payload);
+});
+
+$('downloadBtn').addEventListener('click', () => {
+  if (!window.__lastPayload) return;
+  const link = document.createElement('a');
+  link.download = 'datamatrix_hibc.png';
+  link.href = $('dmCanvas').toDataURL('image/png');
+  link.click();
+});
+
+/* ---------- Captura automática desde pistola (modo teclado) ---------- */
+const hidden = $('scanInput');
+// Mantener foco en input oculto para capturar el escaneo + Enter
+function focusHidden(){ hidden.focus(); }
+window.addEventListener('load', focusHidden);
+window.addEventListener('click', focusHidden);
+setInterval(() => { if (document.activeElement !== hidden) hidden.focus(); }, 1200);
+
+// Acumular caracteres hasta Enter
+let buffer = '';
+hidden.addEventListener('keydown', (ev) => {
+  if (ev.key === 'Enter') {
+    ev.preventDefault();
+    $('raw').value = buffer.trim();
+    buffer = '';
+    $('parseBtn').click();
+    return;
+  }
+  if (ev.key.length === 1) buffer += ev.key; // caracteres imprimibles
+});
+
+// También permitir Enter en el input visible
+$('raw').addEventListener('keydown', (ev) => {
+  if (ev.key === 'Enter') { ev.preventDefault(); $('parseBtn').click(); }
+});
+</script>
+</body>
+</html>
